@@ -65,6 +65,8 @@ constexpr char kModeAny[] = "any_fullscreen";
 constexpr char kModeWindow[] = "window";
 constexpr char kBackendGameCapture[] = "game_capture";
 constexpr char kBackendWindowDisplay[] = "window_display";
+constexpr char kBackendWindowDXGI[] = "window_dxgi";
+constexpr char kBackendDesktopDuplication[] = "desktop_duplication";
 constexpr char kWindowDisplayFrameSourceId[] = "game_output_capture_window_display_frame";
 constexpr char kBackendToggleHotkeyName[] = "GameOutputCapture.ToggleCaptureBackend";
 constexpr uint32_t kFallbackWidth = 1280;
@@ -76,6 +78,7 @@ constexpr uint64_t kForegroundDebounceNs = 500'000'000ULL;
 enum class CaptureBackend {
 	GameCapture,
 	WindowDisplay,
+	DesktopDuplication,
 };
 
 struct WindowDisplayFrameSource {
@@ -100,6 +103,7 @@ struct GameOutputCapture {
 	obs_source_t *windowDisplaySource = nullptr;
 	obs_hotkey_id backendToggleHotkey = OBS_INVALID_HOTKEY_ID;
 	std::atomic<CaptureBackend> backend{CaptureBackend::GameCapture};
+	std::atomic<CaptureBackend> videoBackend{CaptureBackend::WindowDisplay};
 	std::atomic<bool> sourceShowing{false};
 	std::mutex backendMutex;
 	std::atomic<DWORD> processId{0};
@@ -359,6 +363,81 @@ bool create_output_device(HMONITOR monitor, ComPtr<ID3D11Device> &device)
 	return false;
 }
 
+HRESULT create_output_duplication(HMONITOR monitor, ComPtr<ID3D11Device> &device,
+				  ComPtr<ID3D11DeviceContext> &context,
+				  ComPtr<IDXGIOutputDuplication> &duplication,
+				  const char *&failedStage, std::wstring &adapterName,
+				  std::wstring &outputName)
+{
+	failedStage = "CreateDXGIFactory1";
+	ComPtr<IDXGIFactory1> factory;
+	HRESULT result = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+	if (FAILED(result))
+		return result;
+
+	for (UINT adapterIndex = 0;; ++adapterIndex) {
+		ComPtr<IDXGIAdapter1> adapter;
+		failedStage = "IDXGIFactory1::EnumAdapters1";
+		result = factory->EnumAdapters1(adapterIndex, &adapter);
+		if (result == DXGI_ERROR_NOT_FOUND)
+			break;
+		if (FAILED(result))
+			return result;
+
+		for (UINT outputIndex = 0;; ++outputIndex) {
+			ComPtr<IDXGIOutput> output;
+			failedStage = "IDXGIAdapter1::EnumOutputs";
+			result = adapter->EnumOutputs(outputIndex, &output);
+			if (result == DXGI_ERROR_NOT_FOUND)
+				break;
+			if (FAILED(result))
+				return result;
+
+			DXGI_OUTPUT_DESC outputDesc{};
+			failedStage = "IDXGIOutput::GetDesc";
+			result = output->GetDesc(&outputDesc);
+			if (FAILED(result))
+				return result;
+			if (outputDesc.Monitor != monitor)
+				continue;
+
+			DXGI_ADAPTER_DESC1 adapterDesc{};
+			failedStage = "IDXGIAdapter1::GetDesc1";
+			result = adapter->GetDesc1(&adapterDesc);
+			if (FAILED(result))
+				return result;
+			adapterName = adapterDesc.Description;
+			outputName = outputDesc.DeviceName;
+
+			D3D_FEATURE_LEVEL featureLevel{};
+			failedStage = "D3D11CreateDevice";
+			result = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+						   D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+						   D3D11_SDK_VERSION, &device, &featureLevel, &context);
+			if (FAILED(result))
+				return result;
+
+			ComPtr<IDXGIOutput1> output1;
+			failedStage = "IDXGIOutput::QueryInterface(IDXGIOutput1)";
+			result = output.As(&output1);
+			if (SUCCEEDED(result)) {
+				failedStage = "IDXGIOutput1::DuplicateOutput";
+				result = output1->DuplicateOutput(device.Get(), &duplication);
+			}
+			if (FAILED(result)) {
+				device.Reset();
+				context.Reset();
+				return result;
+			}
+
+			return S_OK;
+		}
+	}
+
+	failedStage = "matching the monitor to an adapter output";
+	return DXGI_ERROR_NOT_FOUND;
+}
+
 void output_transparent_frame(GameOutputCapture *capture, uint32_t width, uint32_t height)
 {
 	if (!capture->windowDisplaySource)
@@ -429,7 +508,14 @@ void set_capture_cursor(const winrt::Windows::Graphics::Capture::GraphicsCapture
 	}
 }
 
-void video_capture_loop_impl(GameOutputCapture *capture)
+void composite_desktop_duplication_cursor(std::vector<uint8_t> &pixels, uint32_t width,
+					  uint32_t height, uint32_t rowPitch,
+					  const std::vector<uint8_t> &shape,
+					  const DXGI_OUTDUPL_POINTER_SHAPE_INFO &shapeInfo,
+					  POINT pointerPosition, const RECT &monitorRect, const RECT &crop,
+					  uint32_t desktopWidth, uint32_t desktopHeight);
+
+void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground)
 {
 	winrt::init_apartment(winrt::apartment_type::multi_threaded);
 	using namespace winrt::Windows::Graphics::Capture;
@@ -439,6 +525,14 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 	ComPtr<ID3D11Device> device;
 	ComPtr<ID3D11DeviceContext> context;
 	ComPtr<ID3D11Texture2D> staging;
+	ComPtr<ID3D11Device> dxgiDevice;
+	ComPtr<ID3D11DeviceContext> dxgiContext;
+	ComPtr<IDXGIOutputDuplication> dxgiDuplication;
+	ComPtr<ID3D11Texture2D> dxgiStaging;
+	std::vector<uint8_t> dxgiPointerShape;
+	DXGI_OUTDUPL_POINTER_SHAPE_INFO dxgiPointerShapeInfo{};
+	POINT dxgiPointerPosition{};
+	bool dxgiPointerVisible = false;
 	GraphicsCaptureItem captureItem{nullptr};
 	Direct3D11CaptureFramePool framePool{nullptr};
 	GraphicsCaptureSession session{nullptr};
@@ -593,6 +687,12 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 			staging.Reset();
 			context.Reset();
 			device.Reset();
+			dxgiDuplication.Reset();
+			dxgiStaging.Reset();
+			dxgiContext.Reset();
+			dxgiDevice.Reset();
+			dxgiPointerShape.clear();
+			dxgiPointerVisible = false;
 			currentWindow = nullptr;
 			currentMonitor = nullptr;
 			foregroundSinceNs = 0;
@@ -618,6 +718,12 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 			staging.Reset();
 			context.Reset();
 			device.Reset();
+			dxgiDuplication.Reset();
+			dxgiStaging.Reset();
+			dxgiContext.Reset();
+			dxgiDevice.Reset();
+			dxgiPointerShape.clear();
+			dxgiPointerVisible = false;
 			currentWindow = target.window;
 			currentWindowRect = target.windowRect;
 			currentMonitor = target.monitor;
@@ -708,17 +814,51 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 		if (processIsForeground) {
 			if (foregroundSinceNs == 0)
 				foregroundSinceNs = focusCheckTimeNs;
-			if (!monitorCaptureAttempted) {
+			const bool focusDebounced =
+				focusCheckTimeNs - foregroundSinceNs >= kForegroundDebounceNs;
+			if (!monitorCaptureAttempted && (!useDxgiForeground || focusDebounced)) {
 				monitorCaptureAttempted = true;
-				start_monitor_capture();
+				if (useDxgiForeground) {
+					const char *failedStage = "unknown";
+					std::wstring adapterName;
+					std::wstring outputName;
+					const HRESULT result = create_output_duplication(
+						currentMonitor, dxgiDevice, dxgiContext, dxgiDuplication,
+						failedStage, adapterName, outputName);
+					if (FAILED(result)) {
+						obs_log(LOG_WARNING,
+							"Could not start foreground DXGI capture for monitor %p "
+							"(stage: %s, adapter: %ls, output: %ls, HRESULT: 0x%08lX); "
+							"continuing with selected-window capture.",
+							currentMonitor, failedStage,
+							adapterName.empty() ? L"<unknown>" : adapterName.c_str(),
+							outputName.empty() ? L"<unknown>" : outputName.c_str(),
+							static_cast<unsigned long>(result));
+						dxgiDuplication.Reset();
+						dxgiContext.Reset();
+						dxgiDevice.Reset();
+					} else {
+						obs_log(LOG_INFO,
+							"Foreground DXGI capture started after the selected "
+							"application remained focused for 500 ms.");
+					}
+				} else {
+					start_monitor_capture();
+				}
 			}
-			usingMonitorCapture = monitorCaptureAvailable &&
-					      focusCheckTimeNs - foregroundSinceNs >=
-						      kForegroundDebounceNs;
+			usingMonitorCapture = useDxgiForeground ?
+						      dxgiDuplication && focusDebounced :
+						      monitorCaptureAvailable && focusDebounced;
 		} else {
 			foregroundSinceNs = 0;
 			usingMonitorCapture = false;
 			monitorCaptureAttempted = false;
+			dxgiDuplication.Reset();
+			dxgiStaging.Reset();
+			dxgiContext.Reset();
+			dxgiDevice.Reset();
+			dxgiPointerShape.clear();
+			dxgiPointerVisible = false;
 			if (monitorCaptureAvailable)
 				stop_monitor_capture();
 		}
@@ -736,7 +876,9 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 		}
 		if (!haveLoggedCaptureMode || usingMonitorCapture != lastLoggedMonitorMode) {
 			obs_log(LOG_INFO, "Active video capture path: %s.",
-				usingMonitorCapture ? "foreground monitor crop" : "application window");
+				usingMonitorCapture ?
+					(useDxgiForeground ? "foreground DXGI crop" : "foreground monitor crop") :
+					"application window");
 			haveLoggedCaptureMode = true;
 			lastLoggedMonitorMode = usingMonitorCapture;
 			capturedFrames = 0;
@@ -757,6 +899,145 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 			dequeueToSubmissionMaxNs = 0;
 			previousFrameTimestampNs = 0;
 			lastTimingLogNs = focusCheckTimeNs;
+		}
+		if (useDxgiForeground && usingMonitorCapture) {
+			DXGI_OUTDUPL_FRAME_INFO dxgiFrameInfo{};
+			ComPtr<IDXGIResource> dxgiResource;
+			const HRESULT acquireResult = dxgiDuplication->AcquireNextFrame(
+				50, &dxgiFrameInfo, dxgiResource.GetAddressOf());
+			if (acquireResult == DXGI_ERROR_WAIT_TIMEOUT)
+				continue;
+			if (acquireResult == DXGI_ERROR_ACCESS_LOST || FAILED(acquireResult)) {
+				obs_log(LOG_WARNING,
+					"Foreground DXGI capture lost access to its output (0x%08lX); "
+					"returning to selected-window capture and retrying.",
+					static_cast<unsigned long>(acquireResult));
+				dxgiDuplication.Reset();
+				dxgiStaging.Reset();
+				dxgiContext.Reset();
+				dxgiDevice.Reset();
+				monitorCaptureAttempted = false;
+				continue;
+			}
+
+			struct DxgiFrameRelease {
+				IDXGIOutputDuplication *duplication;
+				~DxgiFrameRelease() { duplication->ReleaseFrame(); }
+			} dxgiFrameRelease{dxgiDuplication.Get()};
+
+			if (dxgiFrameInfo.LastMouseUpdateTime.QuadPart != 0) {
+				dxgiPointerPosition = dxgiFrameInfo.PointerPosition.Position;
+				dxgiPointerVisible = dxgiFrameInfo.PointerPosition.Visible != FALSE;
+			}
+			if (dxgiFrameInfo.PointerShapeBufferSize > 0) {
+				dxgiPointerShape.resize(dxgiFrameInfo.PointerShapeBufferSize);
+				UINT bufferSize = 0;
+				const HRESULT shapeResult = dxgiDuplication->GetFramePointerShape(
+					dxgiFrameInfo.PointerShapeBufferSize, dxgiPointerShape.data(),
+					&bufferSize, &dxgiPointerShapeInfo);
+				if (SUCCEEDED(shapeResult))
+					dxgiPointerShape.resize(bufferSize);
+				else
+					dxgiPointerShape.clear();
+			}
+
+			ComPtr<ID3D11Texture2D> desktopTexture;
+			HRESULT result = dxgiResource.As(&desktopTexture);
+			D3D11_TEXTURE2D_DESC desktopDesc{};
+			if (SUCCEEDED(result))
+				desktopTexture->GetDesc(&desktopDesc);
+			const LONG monitorWidth = currentMonitorRect.right - currentMonitorRect.left;
+			const LONG monitorHeight = currentMonitorRect.bottom - currentMonitorRect.top;
+			if (FAILED(result) || !desktopDesc.Width || !desktopDesc.Height ||
+			    monitorWidth <= 0 || monitorHeight <= 0)
+				continue;
+
+			const double scaleX = desktopDesc.Width / static_cast<double>(monitorWidth);
+			const double scaleY = desktopDesc.Height / static_cast<double>(monitorHeight);
+			RECT crop{
+				static_cast<LONG>(std::floor(
+					(target.clientRect.left - currentMonitorRect.left) * scaleX)),
+				static_cast<LONG>(std::floor(
+					(target.clientRect.top - currentMonitorRect.top) * scaleY)),
+				static_cast<LONG>(std::ceil(
+					(target.clientRect.right - currentMonitorRect.left) * scaleX)),
+				static_cast<LONG>(std::ceil(
+					(target.clientRect.bottom - currentMonitorRect.top) * scaleY)),
+			};
+			crop.left = std::clamp<LONG>(crop.left, 0, static_cast<LONG>(desktopDesc.Width));
+			crop.top = std::clamp<LONG>(crop.top, 0, static_cast<LONG>(desktopDesc.Height));
+			crop.right = std::clamp<LONG>(crop.right, 0, static_cast<LONG>(desktopDesc.Width));
+			crop.bottom = std::clamp<LONG>(crop.bottom, 0, static_cast<LONG>(desktopDesc.Height));
+			if (crop.right <= crop.left || crop.bottom <= crop.top)
+				continue;
+
+			const uint32_t width = static_cast<uint32_t>(crop.right - crop.left);
+			const uint32_t height = static_cast<uint32_t>(crop.bottom - crop.top);
+			const uint64_t byteCount = static_cast<uint64_t>(width) * height * 4;
+			if (width > kMaxCaptureDimension || height > kMaxCaptureDimension ||
+			    byteCount > kMaxCaptureBytes)
+				continue;
+
+			D3D11_TEXTURE2D_DESC stagingDesc = desktopDesc;
+			stagingDesc.Width = width;
+			stagingDesc.Height = height;
+			stagingDesc.MipLevels = 1;
+			stagingDesc.ArraySize = 1;
+			stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			stagingDesc.SampleDesc.Count = 1;
+			stagingDesc.SampleDesc.Quality = 0;
+			stagingDesc.Usage = D3D11_USAGE_STAGING;
+			stagingDesc.BindFlags = 0;
+			stagingDesc.MiscFlags = 0;
+			stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			D3D11_TEXTURE2D_DESC previousDesc{};
+			if (dxgiStaging)
+				dxgiStaging->GetDesc(&previousDesc);
+			if (!dxgiStaging || previousDesc.Width != width ||
+			    previousDesc.Height != height || previousDesc.Format != stagingDesc.Format) {
+				dxgiStaging.Reset();
+				result = dxgiDevice->CreateTexture2D(&stagingDesc, nullptr, &dxgiStaging);
+			}
+			if (FAILED(result))
+				continue;
+
+			const D3D11_BOX region{static_cast<UINT>(crop.left), static_cast<UINT>(crop.top),
+					       0, static_cast<UINT>(crop.right),
+					       static_cast<UINT>(crop.bottom), 1};
+			dxgiContext->CopySubresourceRegion(dxgiStaging.Get(), 0, 0, 0, 0,
+							  desktopTexture.Get(), 0, &region);
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			result = dxgiContext->Map(dxgiStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+			if (FAILED(result))
+				continue;
+
+			std::vector<uint8_t> framePixels(static_cast<size_t>(byteCount));
+			for (uint32_t y = 0; y < height; ++y)
+				std::memcpy(framePixels.data() + static_cast<size_t>(y) * width * 4,
+					    static_cast<const uint8_t *>(mapped.pData) +
+						    static_cast<size_t>(y) * mapped.RowPitch,
+					    static_cast<size_t>(width) * 4);
+			dxgiContext->Unmap(dxgiStaging.Get(), 0);
+			if (captureCursor && dxgiPointerVisible)
+				composite_desktop_duplication_cursor(
+					framePixels, width, height, width * 4, dxgiPointerShape,
+					dxgiPointerShapeInfo, dxgiPointerPosition, currentMonitorRect, crop,
+					desktopDesc.Width, desktopDesc.Height);
+
+			WindowInfo stillActive{};
+			if (get_window_info(target.window, processId, stillActive) &&
+			    is_process_foreground(processId) && stillActive.window == target.window &&
+			    stillActive.monitor == target.monitor &&
+			    stillActive.clientRect.left == target.clientRect.left &&
+			    stillActive.clientRect.top == target.clientRect.top &&
+			    stillActive.clientRect.right == target.clientRect.right &&
+			    stillActive.clientRect.bottom == target.clientRect.bottom) {
+				uint64_t submissionTimeNs = 0;
+				output_captured_frame(capture, framePixels.data(), width, height, width * 4,
+						      os_gettime_ns(), submissionTimeNs);
+				unavailableFrameSent = false;
+			}
+			continue;
 		}
 		if (lastVideoInfoCheckNs == 0 ||
 		    focusCheckTimeNs - lastVideoInfoCheckNs >= 1'000'000'000ULL) {
@@ -1081,14 +1362,381 @@ void video_capture_loop_impl(GameOutputCapture *capture)
 	winrt::uninit_apartment();
 }
 
+void composite_desktop_duplication_cursor(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height,
+					  uint32_t rowPitch, const std::vector<uint8_t> &shape,
+					  const DXGI_OUTDUPL_POINTER_SHAPE_INFO &shapeInfo,
+					  POINT pointerPosition, const RECT &monitorRect, const RECT &crop,
+					  uint32_t desktopWidth, uint32_t desktopHeight)
+{
+	if (shape.empty() || !shapeInfo.Width || !shapeInfo.Height)
+		return;
+
+	const double scaleX = desktopWidth /
+			      static_cast<double>(monitorRect.right - monitorRect.left);
+	const double scaleY = desktopHeight /
+			      static_cast<double>(monitorRect.bottom - monitorRect.top);
+	const uint32_t shapeHeight =
+		shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ? shapeInfo.Height / 2 :
+										      shapeInfo.Height;
+	const LONG pointerLeft = pointerPosition.x - monitorRect.left -
+				 static_cast<LONG>(std::lround(shapeInfo.HotSpot.x / scaleX));
+	const LONG pointerTop = pointerPosition.y - monitorRect.top -
+				static_cast<LONG>(std::lround(shapeInfo.HotSpot.y / scaleY));
+	const LONG left = static_cast<LONG>(std::floor(pointerLeft * scaleX));
+	const LONG top = static_cast<LONG>(std::floor(pointerTop * scaleY));
+	const uint32_t outputWidth = pixels.empty() ? 0 : width;
+	const uint32_t outputHeight = pixels.empty() ? 0 : height;
+
+	for (uint32_t y = 0; y < outputHeight; ++y) {
+		const LONG desktopY = crop.top + static_cast<LONG>(y);
+		const LONG cursorY = desktopY - top;
+		if (cursorY < 0 || cursorY >= static_cast<LONG>(std::ceil(shapeHeight * scaleY)))
+			continue;
+		const uint32_t sourceY = static_cast<uint32_t>(cursorY / scaleY);
+		if (sourceY >= shapeHeight)
+			continue;
+
+		for (uint32_t x = 0; x < outputWidth; ++x) {
+			const LONG desktopX = crop.left + static_cast<LONG>(x);
+			const LONG cursorX = desktopX - left;
+			if (cursorX < 0 || cursorX >= static_cast<LONG>(std::ceil(shapeInfo.Width * scaleX)))
+				continue;
+			const uint32_t sourceX = static_cast<uint32_t>(cursorX / scaleX);
+			if (sourceX >= shapeInfo.Width)
+				continue;
+
+			uint8_t *destination = pixels.data() + static_cast<size_t>(y) * rowPitch +
+					       static_cast<size_t>(x) * 4;
+			if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR ||
+			    shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+				const size_t offset = static_cast<size_t>(sourceY) * shapeInfo.Pitch +
+						      static_cast<size_t>(sourceX) * 4;
+				if (offset + 4 > shape.size())
+					return;
+				const uint8_t *source = shape.data() + offset;
+				if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR &&
+				    source[3] == 0) {
+					destination[0] ^= source[0];
+					destination[1] ^= source[1];
+					destination[2] ^= source[2];
+				} else if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+					std::memcpy(destination, source, 3);
+				} else {
+					const uint32_t alpha = source[3];
+					const uint32_t inverseAlpha = 255 - alpha;
+					for (size_t channel = 0; channel < 3; ++channel)
+						destination[channel] = static_cast<uint8_t>(
+							(source[channel] * alpha +
+							 destination[channel] * inverseAlpha + 127) /
+							255);
+				}
+				destination[3] = 0xFF;
+			} else if (shapeInfo.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+				const size_t byteIndex = sourceX / 8;
+				const uint8_t bit = static_cast<uint8_t>(0x80 >> (sourceX % 8));
+				const size_t andOffset = static_cast<size_t>(sourceY) * shapeInfo.Pitch + byteIndex;
+				const size_t xorOffset = andOffset +
+							 static_cast<size_t>(shapeInfo.Pitch) * shapeHeight;
+				if (xorOffset >= shape.size() || andOffset >= shape.size())
+					return;
+				const bool andBit = (shape[andOffset] & bit) != 0;
+				const bool xorBit = (shape[xorOffset] & bit) != 0;
+				for (size_t channel = 0; channel < 3; ++channel) {
+					if (!andBit)
+						destination[channel] = xorBit ? 0xFF : 0;
+					else if (xorBit)
+						destination[channel] = static_cast<uint8_t>(~destination[channel]);
+				}
+				destination[3] = 0xFF;
+			}
+		}
+	}
+}
+
+bool desktop_duplication_capture_loop(GameOutputCapture *capture)
+{
+	ComPtr<ID3D11Device> device;
+	ComPtr<ID3D11DeviceContext> context;
+	ComPtr<IDXGIOutputDuplication> duplication;
+	ComPtr<ID3D11Texture2D> staging;
+	HMONITOR currentMonitor = nullptr;
+	HWND currentWindow = nullptr;
+	RECT currentMonitorRect{};
+	uint64_t lastTargetSearchNs = 0;
+	uint32_t lastWidth = kFallbackWidth;
+	uint32_t lastHeight = kFallbackHeight;
+	bool unavailableFrameSent = false;
+	bool warnedAboutInitialization = false;
+	bool warnedAboutCapture = false;
+	bool warnedAboutCursor = false;
+	std::vector<uint8_t> pointerShape;
+	DXGI_OUTDUPL_POINTER_SHAPE_INFO pointerShapeInfo{};
+	POINT pointerPosition{};
+	bool pointerVisible = false;
+
+	while (WaitForSingleObject(capture->videoStopEvent, 0) != WAIT_OBJECT_0) {
+		const DWORD processId = capture->processId.load();
+		WindowInfo target{};
+		const uint64_t now = os_gettime_ns();
+		bool targetAvailable = currentWindow && get_window_info(currentWindow, processId, target);
+		if (!targetAvailable &&
+		    (lastTargetSearchNs == 0 || now - lastTargetSearchNs >= 100'000'000ULL)) {
+			targetAvailable = get_process_window_target(processId, target);
+			lastTargetSearchNs = now;
+		}
+
+		if (!targetAvailable) {
+			duplication.Reset();
+			staging.Reset();
+			context.Reset();
+			device.Reset();
+			currentMonitor = nullptr;
+			currentWindow = nullptr;
+			if (!unavailableFrameSent) {
+				output_transparent_frame(capture, lastWidth, lastHeight);
+				unavailableFrameSent = true;
+			}
+			WaitForSingleObject(capture->videoStopEvent, 50);
+			continue;
+		}
+
+		currentWindow = target.window;
+		lastWidth = target.width;
+		lastHeight = target.height;
+		unavailableFrameSent = false;
+		if (target.monitor != currentMonitor) {
+			duplication.Reset();
+			staging.Reset();
+			context.Reset();
+			device.Reset();
+			pointerShape.clear();
+			pointerVisible = false;
+			warnedAboutInitialization = false;
+			currentMonitor = target.monitor;
+			MONITORINFO monitorInfo{sizeof(monitorInfo)};
+			if (!GetMonitorInfoW(currentMonitor, &monitorInfo)) {
+				obs_log(LOG_WARNING,
+					"Could not determine the selected application's monitor bounds "
+					"(error %lu).",
+					GetLastError());
+				currentMonitor = nullptr;
+				continue;
+			}
+			currentMonitorRect = monitorInfo.rcMonitor;
+		}
+
+		if (!duplication) {
+			const char *failedStage = "unknown";
+			std::wstring adapterName;
+			std::wstring outputName;
+			const HRESULT initializeResult =
+				create_output_duplication(currentMonitor, device, context, duplication,
+							  failedStage, adapterName, outputName);
+			if (FAILED(initializeResult)) {
+				if (!warnedAboutInitialization) {
+					obs_log(LOG_WARNING,
+						"Could not start DXGI Desktop Duplication for monitor %p "
+						"(stage: %s, adapter: %ls, output: %ls, HRESULT: 0x%08lX)%s.",
+						currentMonitor,
+						failedStage, adapterName.empty() ? L"<unknown>" : adapterName.c_str(),
+						outputName.empty() ? L"<unknown>" : outputName.c_str(),
+						static_cast<unsigned long>(initializeResult),
+						initializeResult == DXGI_ERROR_UNSUPPORTED ?
+							"; switching to Windows Graphics Capture" :
+							"; retrying");
+					warnedAboutInitialization = true;
+				}
+				if (initializeResult == DXGI_ERROR_UNSUPPORTED)
+					return true;
+				WaitForSingleObject(capture->videoStopEvent, 1000);
+				continue;
+			}
+			warnedAboutInitialization = false;
+			obs_log(LOG_INFO, "DXGI Desktop Duplication started for monitor %p.", currentMonitor);
+		}
+
+		DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+		ComPtr<IDXGIResource> resource;
+		const HRESULT acquireResult =
+			duplication->AcquireNextFrame(50, &frameInfo, resource.GetAddressOf());
+		if (acquireResult == DXGI_ERROR_WAIT_TIMEOUT)
+			continue;
+		if (acquireResult == DXGI_ERROR_ACCESS_LOST) {
+			duplication.Reset();
+			staging.Reset();
+			context.Reset();
+			device.Reset();
+			WaitForSingleObject(capture->videoStopEvent, 100);
+			continue;
+		}
+		if (FAILED(acquireResult)) {
+			if (!warnedAboutCapture) {
+				obs_log(LOG_WARNING,
+					"DXGI Desktop Duplication could not acquire a frame (0x%08lX); "
+					"reinitializing.",
+					static_cast<unsigned long>(acquireResult));
+				warnedAboutCapture = true;
+			}
+			duplication.Reset();
+			staging.Reset();
+			WaitForSingleObject(capture->videoStopEvent, 500);
+			continue;
+		}
+
+		struct FrameRelease {
+			IDXGIOutputDuplication *duplication;
+			~FrameRelease() { duplication->ReleaseFrame(); }
+		} frameRelease{duplication.Get()};
+		warnedAboutCapture = false;
+
+		if (frameInfo.LastMouseUpdateTime.QuadPart != 0) {
+			pointerPosition = frameInfo.PointerPosition.Position;
+			pointerVisible = frameInfo.PointerPosition.Visible != FALSE;
+		}
+		if (frameInfo.PointerShapeBufferSize > 0) {
+			pointerShape.resize(frameInfo.PointerShapeBufferSize);
+			UINT bufferSize = 0;
+			const HRESULT shapeResult = duplication->GetFramePointerShape(
+				frameInfo.PointerShapeBufferSize, pointerShape.data(), &bufferSize,
+				&pointerShapeInfo);
+			if (SUCCEEDED(shapeResult)) {
+				pointerShape.resize(bufferSize);
+			} else {
+				pointerShape.clear();
+				if (!warnedAboutCursor) {
+					obs_log(LOG_WARNING,
+						"Could not read the DXGI desktop pointer shape "
+						"(0x%08lX).",
+						static_cast<unsigned long>(shapeResult));
+					warnedAboutCursor = true;
+				}
+			}
+		}
+
+		ComPtr<ID3D11Texture2D> desktopTexture;
+		HRESULT result = resource.As(&desktopTexture);
+		if (FAILED(result)) {
+			obs_log(LOG_WARNING,
+				"Could not access a DXGI Desktop Duplication frame texture (0x%08lX).",
+				static_cast<unsigned long>(result));
+			continue;
+		}
+
+		D3D11_TEXTURE2D_DESC desktopDesc{};
+		desktopTexture->GetDesc(&desktopDesc);
+		const LONG monitorWidth = currentMonitorRect.right - currentMonitorRect.left;
+		const LONG monitorHeight = currentMonitorRect.bottom - currentMonitorRect.top;
+		if (monitorWidth <= 0 || monitorHeight <= 0 || !desktopDesc.Width || !desktopDesc.Height)
+			continue;
+
+		const double scaleX = desktopDesc.Width / static_cast<double>(monitorWidth);
+		const double scaleY = desktopDesc.Height / static_cast<double>(monitorHeight);
+		RECT crop{
+			static_cast<LONG>(std::floor((target.clientRect.left - currentMonitorRect.left) * scaleX)),
+			static_cast<LONG>(std::floor((target.clientRect.top - currentMonitorRect.top) * scaleY)),
+			static_cast<LONG>(std::ceil((target.clientRect.right - currentMonitorRect.left) * scaleX)),
+			static_cast<LONG>(std::ceil((target.clientRect.bottom - currentMonitorRect.top) * scaleY)),
+		};
+		crop.left = std::clamp<LONG>(crop.left, 0, static_cast<LONG>(desktopDesc.Width));
+		crop.top = std::clamp<LONG>(crop.top, 0, static_cast<LONG>(desktopDesc.Height));
+		crop.right = std::clamp<LONG>(crop.right, 0, static_cast<LONG>(desktopDesc.Width));
+		crop.bottom = std::clamp<LONG>(crop.bottom, 0, static_cast<LONG>(desktopDesc.Height));
+		if (crop.right <= crop.left || crop.bottom <= crop.top)
+			continue;
+
+		const uint32_t width = static_cast<uint32_t>(crop.right - crop.left);
+		const uint32_t height = static_cast<uint32_t>(crop.bottom - crop.top);
+		const uint64_t byteCount = static_cast<uint64_t>(width) * height * 4;
+		if (width > kMaxCaptureDimension || height > kMaxCaptureDimension ||
+		    byteCount > kMaxCaptureBytes) {
+			obs_log(LOG_WARNING, "DXGI Desktop Duplication crop exceeds capture limits.");
+			continue;
+		}
+
+		D3D11_TEXTURE2D_DESC stagingDesc = desktopDesc;
+		stagingDesc.Width = width;
+		stagingDesc.Height = height;
+		stagingDesc.MipLevels = 1;
+		stagingDesc.ArraySize = 1;
+		stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		stagingDesc.SampleDesc.Count = 1;
+		stagingDesc.SampleDesc.Quality = 0;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.BindFlags = 0;
+		stagingDesc.MiscFlags = 0;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		D3D11_TEXTURE2D_DESC previousDesc{};
+		if (staging)
+			staging->GetDesc(&previousDesc);
+		if (!staging || previousDesc.Width != width || previousDesc.Height != height ||
+		    previousDesc.Format != stagingDesc.Format) {
+			staging.Reset();
+			result = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
+			if (FAILED(result)) {
+				obs_log(LOG_WARNING,
+					"Could not create the DXGI Desktop Duplication staging texture "
+					"(0x%08lX).",
+					static_cast<unsigned long>(result));
+				continue;
+			}
+		}
+
+		const D3D11_BOX region{static_cast<UINT>(crop.left), static_cast<UINT>(crop.top), 0,
+				       static_cast<UINT>(crop.right), static_cast<UINT>(crop.bottom), 1};
+		context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, desktopTexture.Get(), 0,
+					       &region);
+		std::vector<uint8_t> framePixels(static_cast<size_t>(byteCount));
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+		if (FAILED(result)) {
+			obs_log(LOG_WARNING,
+				"Could not map a DXGI Desktop Duplication frame (0x%08lX).",
+				static_cast<unsigned long>(result));
+			continue;
+		}
+
+		for (uint32_t y = 0; y < height; ++y)
+			std::memcpy(framePixels.data() + static_cast<size_t>(y) * width * 4,
+				    static_cast<const uint8_t *>(mapped.pData) +
+					    static_cast<size_t>(y) * mapped.RowPitch,
+				    static_cast<size_t>(width) * 4);
+		context->Unmap(staging.Get(), 0);
+
+		if (capture->captureCursor.load() && pointerVisible)
+			composite_desktop_duplication_cursor(
+				framePixels, width, height, width * 4, pointerShape, pointerShapeInfo,
+				pointerPosition, currentMonitorRect, crop, desktopDesc.Width,
+				desktopDesc.Height);
+
+		WindowInfo stillActive{};
+		if (get_window_info(target.window, processId, stillActive) &&
+		    stillActive.window == target.window && stillActive.monitor == target.monitor &&
+		    stillActive.clientRect.left == target.clientRect.left &&
+		    stillActive.clientRect.top == target.clientRect.top &&
+		    stillActive.clientRect.right == target.clientRect.right &&
+		    stillActive.clientRect.bottom == target.clientRect.bottom) {
+			uint64_t submissionTimeNs = 0;
+			output_captured_frame(capture, framePixels.data(), width, height, width * 4,
+					      os_gettime_ns(), submissionTimeNs);
+		}
+	}
+
+	duplication.Reset();
+	staging.Reset();
+	context.Reset();
+	device.Reset();
+	return false;
+}
+
 void video_capture_loop(GameOutputCapture *capture)
 {
 	try {
-		video_capture_loop_impl(capture);
+		video_capture_loop_impl(capture,
+					capture->videoBackend.load() == CaptureBackend::DesktopDuplication);
 	} catch (const std::bad_alloc &) {
 		obs_log(LOG_ERROR, "Video capture stopped because the frame buffer could not be allocated.");
 	} catch (const winrt::hresult_error &error) {
-		obs_log(LOG_ERROR, "Windows Graphics Capture stopped unexpectedly (0x%08lX).",
+		obs_log(LOG_ERROR, "Video capture stopped unexpectedly (0x%08lX).",
 			static_cast<unsigned long>(error.code()));
 		output_transparent_frame(capture, kFallbackWidth, kFallbackHeight);
 	}
@@ -1415,14 +2063,15 @@ void window_display_frame_source_destroy(void *)
 {
 }
 
-bool start_window_display_capture_locked(GameOutputCapture *capture)
+bool start_video_capture_locked(GameOutputCapture *capture, CaptureBackend backend)
 {
 	if (capture->videoThread.joinable() || capture->shuttingDown.load())
 		return true;
 
+	capture->videoBackend.store(backend);
 	capture->videoStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	if (!capture->videoStopEvent) {
-		obs_log(LOG_ERROR, "Could not create the window/display capture shutdown event.");
+		obs_log(LOG_ERROR, "Could not create the video capture shutdown event.");
 		return false;
 	}
 
@@ -1431,15 +2080,17 @@ bool start_window_display_capture_locked(GameOutputCapture *capture)
 	} catch (const std::system_error &error) {
 		CloseHandle(capture->videoStopEvent);
 		capture->videoStopEvent = nullptr;
-		obs_log(LOG_ERROR, "Could not start window/display capture: %s.", error.what());
+		obs_log(LOG_ERROR, "Could not start video capture: %s.", error.what());
 		return false;
 	}
 
-	obs_log(LOG_INFO, "Window/Display capture backend enabled.");
+	obs_log(LOG_INFO, "%s capture backend enabled.",
+		backend == CaptureBackend::DesktopDuplication ? "Window and DXGI" :
+								"Window/Display");
 	return true;
 }
 
-void stop_window_display_capture_locked(GameOutputCapture *capture)
+void stop_video_capture_locked(GameOutputCapture *capture)
 {
 	if (capture->videoStopEvent)
 		SetEvent(capture->videoStopEvent);
@@ -1463,12 +2114,21 @@ bool set_capture_backend(GameOutputCapture *capture, CaptureBackend nextBackend)
 	if (previousBackend == nextBackend)
 		return true;
 
-	if (capture->sourceShowing.load() && nextBackend == CaptureBackend::WindowDisplay) {
+	const bool previousUsesVideo = previousBackend != CaptureBackend::GameCapture;
+	const bool nextUsesVideo = nextBackend != CaptureBackend::GameCapture;
+	if (capture->sourceShowing.load() && nextUsesVideo && !previousUsesVideo) {
 		if (capture->windowDisplaySource)
 			obs_source_inc_showing(capture->windowDisplaySource);
-		if (!start_window_display_capture_locked(capture)) {
+		if (!start_video_capture_locked(capture, nextBackend)) {
 			if (capture->windowDisplaySource)
 				obs_source_dec_showing(capture->windowDisplaySource);
+			return false;
+		}
+	} else if (capture->sourceShowing.load() && previousUsesVideo && nextUsesVideo) {
+		stop_video_capture_locked(capture);
+		if (!start_video_capture_locked(capture, nextBackend)) {
+			if (!start_video_capture_locked(capture, previousBackend))
+				obs_log(LOG_ERROR, "Could not restore the previous video capture method.");
 			return false;
 		}
 	}
@@ -1476,8 +2136,8 @@ bool set_capture_backend(GameOutputCapture *capture, CaptureBackend nextBackend)
 	if (capture->sourceShowing.load() && previousBackend == CaptureBackend::GameCapture) {
 		if (capture->gameCaptureSource && capture->gameCaptureShowing.exchange(false))
 			obs_source_dec_showing(capture->gameCaptureSource);
-	} else if (capture->sourceShowing.load() && previousBackend == CaptureBackend::WindowDisplay) {
-		stop_window_display_capture_locked(capture);
+	} else if (capture->sourceShowing.load() && previousUsesVideo && !nextUsesVideo) {
+		stop_video_capture_locked(capture);
 		if (capture->windowDisplaySource)
 			obs_source_dec_showing(capture->windowDisplaySource);
 	}
@@ -1487,8 +2147,11 @@ bool set_capture_backend(GameOutputCapture *capture, CaptureBackend nextBackend)
 	    capture->gameCaptureSource && !capture->gameCaptureShowing.exchange(true))
 		obs_source_inc_showing(capture->gameCaptureSource);
 
-	obs_log(LOG_INFO, "Capture backend switched to %s.",
-		nextBackend == CaptureBackend::GameCapture ? "Game Capture" : "Window/Display");
+	const char *backendName = nextBackend == CaptureBackend::GameCapture ?
+					  "Game Capture" :
+				  nextBackend == CaptureBackend::DesktopDuplication ?
+					  "Window and DXGI" :
+					  "Window/Display";	obs_log(LOG_INFO, "Capture backend switched to %s.", backendName);
 	return true;
 }
 
@@ -1499,8 +2162,11 @@ void store_capture_backend_setting(GameOutputCapture *capture, CaptureBackend ba
 
 	obs_data_t *settings = obs_source_get_settings(capture->source);
 	obs_data_set_string(settings, SETTING_CAPTURE_BACKEND,
-			    backend == CaptureBackend::GameCapture ? kBackendGameCapture :
-								     kBackendWindowDisplay);
+			    backend == CaptureBackend::GameCapture ?
+				    kBackendGameCapture :
+			    backend == CaptureBackend::DesktopDuplication ?
+				    kBackendWindowDXGI :
+				    kBackendWindowDisplay);
 	obs_source_update(capture->source, settings);
 	obs_data_release(settings);
 }
@@ -1514,9 +2180,13 @@ void toggle_capture_backend(void *data, obs_hotkey_id, obs_hotkey_t *, bool pres
 	if (!capture || capture->shuttingDown.load())
 		return;
 
+	const CaptureBackend currentBackend = capture->backend.load();
 	const CaptureBackend nextBackend =
-		capture->backend.load() == CaptureBackend::GameCapture ? CaptureBackend::WindowDisplay :
-									CaptureBackend::GameCapture;
+		currentBackend == CaptureBackend::GameCapture ?
+			CaptureBackend::WindowDisplay :
+		currentBackend == CaptureBackend::WindowDisplay ?
+			CaptureBackend::DesktopDuplication :
+			CaptureBackend::GameCapture;
 	if (!set_capture_backend(capture, nextBackend)) {
 		obs_log(LOG_ERROR, "Capture backend switch failed; keeping the current backend.");
 		return;
@@ -1527,7 +2197,7 @@ void toggle_capture_backend(void *data, obs_hotkey_id, obs_hotkey_t *, bool pres
 uint32_t source_width(void *data)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
-	if (capture->backend.load() == CaptureBackend::WindowDisplay) {
+	if (capture->backend.load() != CaptureBackend::GameCapture) {
 		const uint32_t width =
 			capture->windowDisplaySource ? obs_source_get_width(capture->windowDisplaySource) : 0;
 		return width ? width : (capture->targetRunning.load() ? capture->targetWidth.load() : 0);
@@ -1548,7 +2218,7 @@ uint32_t source_width(void *data)
 uint32_t source_height(void *data)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
-	if (capture->backend.load() == CaptureBackend::WindowDisplay) {
+	if (capture->backend.load() != CaptureBackend::GameCapture) {
 		const uint32_t height =
 			capture->windowDisplaySource ? obs_source_get_height(capture->windowDisplaySource) : 0;
 		return height ? height : (capture->targetRunning.load() ? capture->targetHeight.load() : 0);
@@ -1569,7 +2239,7 @@ uint32_t source_height(void *data)
 void source_render(void *data, gs_effect_t *)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
-	if (capture->backend.load() == CaptureBackend::WindowDisplay) {
+	if (capture->backend.load() != CaptureBackend::GameCapture) {
 		if (capture->windowDisplaySource)
 			obs_source_video_render(capture->windowDisplaySource);
 		return;
@@ -1612,7 +2282,7 @@ void source_show(void *data)
 	} else {
 		if (capture->windowDisplaySource)
 			obs_source_inc_showing(capture->windowDisplaySource);
-		if (!start_window_display_capture_locked(capture)) {
+		if (!start_video_capture_locked(capture, capture->backend.load())) {
 			if (capture->windowDisplaySource)
 				obs_source_dec_showing(capture->windowDisplaySource);
 			capture->backend.store(CaptureBackend::GameCapture);
@@ -1631,7 +2301,7 @@ void source_hide(void *data)
 		if (capture->gameCaptureSource && capture->gameCaptureShowing.exchange(false))
 			obs_source_dec_showing(capture->gameCaptureSource);
 	} else {
-		stop_window_display_capture_locked(capture);
+		stop_video_capture_locked(capture);
 		if (capture->windowDisplaySource)
 			obs_source_dec_showing(capture->windowDisplaySource);
 	}
@@ -1702,6 +2372,7 @@ obs_properties_t *source_properties(void *data)
 					OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(backend, "Game Capture", kBackendGameCapture);
 	obs_property_list_add_string(backend, "Window and Display", kBackendWindowDisplay);
+	obs_property_list_add_string(backend, obs_module_text("Window and DXGI"), kBackendWindowDXGI);
 
 	obs_property_t *mode = obs_properties_add_list(properties, SETTING_MODE, obs_module_text("Capture mode"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -1740,10 +2411,14 @@ obs_properties_t *source_properties(void *data)
 void update_source(void *data, obs_data_t *settings)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
-	const char *backendSetting = obs_data_get_string(settings, SETTING_CAPTURE_BACKEND);
+		const char *backendSetting = obs_data_get_string(settings, SETTING_CAPTURE_BACKEND);
 	const CaptureBackend requestedBackend =
-		strcmp(backendSetting, kBackendWindowDisplay) == 0 ? CaptureBackend::WindowDisplay :
-								    CaptureBackend::GameCapture;
+			(strcmp(backendSetting, kBackendWindowDXGI) == 0 ||
+			 strcmp(backendSetting, kBackendDesktopDuplication) == 0) ?
+				CaptureBackend::DesktopDuplication :
+			strcmp(backendSetting, kBackendWindowDisplay) == 0 ?
+				CaptureBackend::WindowDisplay :
+				CaptureBackend::GameCapture;
 	if (!set_capture_backend(capture, requestedBackend))
 		obs_log(LOG_ERROR, "Could not switch to the selected capture method.");
 
@@ -1787,10 +2462,13 @@ void *create_source(obs_data_t *settings, obs_source_t *source)
 		return nullptr;
 	}
 	capture->source = source;
-	capture->backend.store(strcmp(obs_data_get_string(settings, SETTING_CAPTURE_BACKEND),
-				     kBackendWindowDisplay) == 0 ?
-				       CaptureBackend::WindowDisplay :
-				       CaptureBackend::GameCapture);
+	const char *backendSetting = obs_data_get_string(settings, SETTING_CAPTURE_BACKEND);
+	capture->backend.store((strcmp(backendSetting, kBackendWindowDXGI) == 0 ||
+				 strcmp(backendSetting, kBackendDesktopDuplication) == 0) ?
+					CaptureBackend::DesktopDuplication :
+				strcmp(backendSetting, kBackendWindowDisplay) == 0 ?
+					CaptureBackend::WindowDisplay :
+					CaptureBackend::GameCapture);
 	const char *mode = obs_data_get_string(settings, SETTING_MODE);
 	const std::string windowMatch = migrate_legacy_window_match(settings);
 	const int priority = static_cast<int>(obs_data_get_int(settings, SETTING_WINDOW_PRIORITY));
@@ -1837,7 +2515,7 @@ void *create_source(obs_data_t *settings, obs_source_t *source)
 		return nullptr;
 	}
 	capture->backendToggleHotkey = obs_hotkey_register_source(
-		source, kBackendToggleHotkeyName, obs_module_text("Toggle capture backend"),
+		source, kBackendToggleHotkeyName, obs_module_text("Cycle capture method"),
 		toggle_capture_backend, capture);
 	start_process_monitor(capture);
 	return capture;
@@ -1846,8 +2524,13 @@ void *create_source(obs_data_t *settings, obs_source_t *source)
 void destroy_source(void *data)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
-	obs_log(LOG_INFO, "Destroying capture source (backend=%s, video_thread=%s).",
-		capture->backend.load() == CaptureBackend::GameCapture ? "Game Capture" : "Window and Display",
+	const CaptureBackend currentBackend = capture->backend.load();
+	const char *backendName = currentBackend == CaptureBackend::GameCapture ?
+					  "Game Capture" :
+				  currentBackend == CaptureBackend::DesktopDuplication ?
+					  "DXGI Desktop Duplication" :
+					  "Window and Display";
+	obs_log(LOG_INFO, "Destroying capture source (backend=%s, video_thread=%s).", backendName,
 		capture->videoThread.joinable() ? "running" : "stopped");
 	capture->shuttingDown.store(true);
 	stop_process_monitor(capture);
@@ -1858,11 +2541,11 @@ void destroy_source(void *data)
 			obs_hotkey_unregister(capture->backendToggleHotkey);
 			capture->backendToggleHotkey = OBS_INVALID_HOTKEY_ID;
 		}
-		stop_window_display_capture_locked(capture);
+		stop_video_capture_locked(capture);
 		if (capture->gameCaptureSource && capture->gameCaptureShowing.exchange(false))
 			obs_source_dec_showing(capture->gameCaptureSource);
 		if (capture->windowDisplaySource && capture->sourceShowing.exchange(false) &&
-		    capture->backend.load() == CaptureBackend::WindowDisplay)
+		    capture->backend.load() != CaptureBackend::GameCapture)
 			obs_source_dec_showing(capture->windowDisplaySource);
 	}
 	if (capture->windowDisplaySource)
