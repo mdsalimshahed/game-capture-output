@@ -30,6 +30,15 @@ cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInf
 
 The CMake preset downloads the OBS 32.2.2 sources and matching OBS dependency archive declared in `buildspec.json`; hashes are verified during download.
 
+## GitHub Releases
+
+Set the version in `buildspec.json` to the intended release version, then push a matching tag to build the Windows package and publish a GitHub release with the ZIP and its SHA-256 checksum. Use a tag such as `0.9.8` for a stable release or `0.9.9-rc1` / `0.9.9-beta1` for a prerelease; do not prefix the tag with `v`.
+
+```powershell
+git tag 0.9.8
+git push origin 0.9.8
+```
+
 ## Use in OBS
 
 1. Extract the `game-output-capture` folder from the release archive into `%PROGRAMDATA%\obs-studio\plugins\` (create the `plugins` folder if necessary). The final path should be `%PROGRAMDATA%\obs-studio\plugins\game-output-capture\bin\64bit\game-output-capture.dll`. This project builds x64 and requires 64-bit OBS.
