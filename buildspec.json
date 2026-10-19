@@ -38,7 +38,7 @@
     },
     "name": "game-output-capture",
     "displayName": "Game Output Capture",
-    "version": "0.9.8",
+    "version": "0.9.9",
     "author": "Copilot",
     "website": "https://github.com/obsproject/obs-studio",
     "email": "noreply@github.com"
