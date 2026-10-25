@@ -239,8 +239,6 @@ void refresh_target_foreground(GameOutputCapture *capture)
 	if (wasTargetForeground != isTargetForeground) {
 		capture->dxgiCaptureActive.store(false);
 		signal_foreground_change(capture);
-		obs_log(LOG_INFO, "Foreground changed: selected application is %s.",
-			isTargetForeground ? "focused" : "not focused");
 	}
 }
 
@@ -335,10 +333,6 @@ private:
 					WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 		available_ = foregroundHook != nullptr;
 		if (available_) {
-			obs_log(LOG_INFO,
-				"Installed event-driven foreground monitoring%s.",
-				locationHook ? " with window-location notifications" :
-					       " (window-location notifications unavailable)");
 			refresh_foreground();
 		}
 		SetEvent(readyEvent_);
@@ -557,7 +551,6 @@ std::string migrate_legacy_window_match(obs_data_t *settings)
 	const std::string migratedMatch = "::" + encodedExecutable;
 	obs_data_set_string(settings, SETTING_WINDOW, migratedMatch.c_str());
 	obs_data_set_string(settings, "application_executable", "");
-	obs_log(LOG_INFO, "Migrated the saved application selection to OBS window-match settings.");
 	return migratedMatch;
 }
 
@@ -723,7 +716,7 @@ void output_transparent_frame(GameOutputCapture *capture, uint32_t width, uint32
 }
 
 void output_captured_frame(GameOutputCapture *capture, uint8_t *pixels, uint32_t width, uint32_t height,
-			   uint32_t rowPitch, uint64_t timestamp, uint64_t &submissionTimeNs,
+			   uint32_t rowPitch, uint64_t timestamp,
 			   std::vector<uint8_t> *reusablePixels = nullptr)
 {
 	if (!capture->windowDisplaySource)
@@ -753,14 +746,12 @@ void output_captured_frame(GameOutputCapture *capture, uint8_t *pixels, uint32_t
 	frame.timestamp = timestamp;
 	frame.format = VIDEO_FORMAT_BGRA;
 	frame.full_range = true;
-	submissionTimeNs = os_gettime_ns();
 	// libobs copies the frame data before obs_source_output_video returns.
 	obs_source_output_video(capture->windowDisplaySource, &frame);
 }
 
 void output_mapped_dxgi_frame(GameOutputCapture *capture, uint8_t *pixels, uint32_t width,
-			      uint32_t height, uint32_t rowPitch, uint64_t timestamp,
-			      uint64_t &submissionTimeNs)
+			      uint32_t height, uint32_t rowPitch, uint64_t timestamp)
 {
 	if (!capture->windowDisplaySource)
 		return;
@@ -778,7 +769,6 @@ void output_mapped_dxgi_frame(GameOutputCapture *capture, uint8_t *pixels, uint3
 	frame.timestamp = timestamp;
 	frame.format = VIDEO_FORMAT_BGRA;
 	frame.full_range = true;
-	submissionTimeNs = os_gettime_ns();
 	obs_source_output_video(capture->windowDisplaySource, &frame);
 }
 
@@ -854,33 +844,15 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 	uint32_t lastHeight = kFallbackHeight;
 	bool unavailableFrameSent = false;
 	bool warnedAboutFrame = false;
-	uint64_t capturedFrames = 0;
-	uint64_t lastFpsLog = os_gettime_ns();
-	uint64_t dxgiCapturedFrames = 0;
-	uint64_t lastDxgiFpsLogNs = lastFpsLog;
 	uint64_t outputFrameIntervalNs = 0;
 	uint64_t nextDueNs = 0;
-	uint64_t pacingDroppedFrames = 0;
 	uint64_t lastVideoInfoCheckNs = 0;
 	uint64_t lastSubmittedFrameTimestampNs = 0;
 	bool warnedAboutVideoInfo = false;
 	bool warnedAboutDxgiMap = false;
-	uint64_t diagnosticFrames = 0;
-	uint64_t validTimestampFrames = 0;
-	uint64_t sourceIntervalCount = 0;
-	uint64_t sourceIntervalSumNs = 0;
-	uint64_t sourceIntervalMinNs = UINT64_MAX;
-	uint64_t sourceIntervalMaxNs = 0;
-	int64_t dequeueAgeSumNs = 0;
-	int64_t dequeueAgeMinNs = INT64_MAX;
-	int64_t dequeueAgeMaxNs = INT64_MIN;
-	int64_t submissionAgeSumNs = 0;
-	int64_t submissionAgeMinNs = INT64_MAX;
-	int64_t submissionAgeMaxNs = INT64_MIN;
-	uint64_t dequeueToSubmissionSumNs = 0;
-	uint64_t dequeueToSubmissionMaxNs = 0;
-	uint64_t previousFrameTimestampNs = 0;
-	uint64_t lastTimingLogNs = lastFpsLog;
+	bool warnedAboutMonitorBounds = false;
+	bool warnedAboutOutputDevice = false;
+	bool warnedAboutWindowCaptureStart = false;
 	HWND currentWindow = nullptr;
 	RECT currentWindowRect{};
 	uint64_t foregroundSinceNs = 0;
@@ -956,11 +928,7 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			monitorFrameArrivedToken = monitorFramePool.FrameArrived(
 				[frameArrivedEvent](Direct3D11CaptureFramePool const &,
 						    winrt::Windows::Foundation::IInspectable const &) {
-					if (!ReleaseSemaphore(frameArrivedEvent, 1, nullptr))
-						obs_log(LOG_WARNING,
-							"Could not queue a monitor-capture frame notification "
-							"(error %lu).",
-							GetLastError());
+					ReleaseSemaphore(frameArrivedEvent, 1, nullptr);
 				});
 			monitorSession = monitorFramePool.CreateCaptureSession(monitorCaptureItem);
 			monitorCursorSetting = capture->captureCursor.load();
@@ -976,8 +944,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			}
 			monitorSession.StartCapture();
 			monitorCaptureAvailable = true;
-			obs_log(LOG_INFO, "Foreground monitor capture started for monitor %p.",
-				currentMonitor);
 			return true;
 		} catch (const winrt::hresult_error &error) {
 			stop_monitor_capture();
@@ -1061,25 +1027,33 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			MONITORINFO monitorInfo{sizeof(monitorInfo)};
 			if (!GetMonitorInfoW(currentMonitor, &monitorInfo)) {
 				currentMonitor = nullptr;
-				obs_log(LOG_WARNING,
-					"Could not determine the selected application's monitor bounds (error %lu).",
-					GetLastError());
+				if (!warnedAboutMonitorBounds) {
+					obs_log(LOG_WARNING,
+						"Could not determine the selected application's monitor bounds (error %lu).",
+						GetLastError());
+					warnedAboutMonitorBounds = true;
+				}
 				output_transparent_frame(capture, lastWidth, lastHeight);
 				unavailableFrameSent = true;
 				WaitForSingleObject(capture->videoStopEvent, 1000);
 				continue;
 			}
 			currentMonitorRect = monitorInfo.rcMonitor;
+			warnedAboutMonitorBounds = false;
 			if (!useGameCaptureWhenUnfocused) {
 				if (!create_output_device(currentMonitor, device)) {
 					currentMonitor = nullptr;
-					obs_log(LOG_WARNING,
-						"Could not create a D3D11 device for the selected application's display.");
+					if (!warnedAboutOutputDevice) {
+						obs_log(LOG_WARNING,
+							"Could not create a D3D11 device for the selected application's display.");
+						warnedAboutOutputDevice = true;
+					}
 					output_transparent_frame(capture, lastWidth, lastHeight);
 					unavailableFrameSent = true;
 					WaitForSingleObject(capture->videoStopEvent, 1000);
 					continue;
 				}
+				warnedAboutOutputDevice = false;
 				device->GetImmediateContext(&context);
 			}
 
@@ -1104,11 +1078,7 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 						[frameArrivedEvent](Direct3D11CaptureFramePool const &,
 								    winrt::Windows::Foundation::
 									    IInspectable const &) {
-							if (!ReleaseSemaphore(frameArrivedEvent, 1, nullptr))
-								obs_log(LOG_WARNING,
-									"Could not queue a Windows Graphics Capture frame notification "
-									"(error %lu).",
-									GetLastError());
+							ReleaseSemaphore(frameArrivedEvent, 1, nullptr);
 						});
 					session = framePool.CreateCaptureSession(captureItem);
 					windowCursorSetting = capture->captureCursor.load();
@@ -1122,14 +1092,15 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 							static_cast<unsigned long>(error.code()));
 					}
 					session.StartCapture();
-					obs_log(LOG_INFO,
-						"Windows Graphics Capture started for selected window %p.",
-						target.window);
+					warnedAboutWindowCaptureStart = false;
 				} catch (const winrt::hresult_error &error) {
-					obs_log(LOG_WARNING,
-						"Could not start Windows Graphics Capture for the selected window "
-						"(0x%08lX).",
-						static_cast<unsigned long>(error.code()));
+					if (!warnedAboutWindowCaptureStart) {
+						obs_log(LOG_WARNING,
+							"Could not start Windows Graphics Capture for the selected window "
+							"(0x%08lX).",
+							static_cast<unsigned long>(error.code()));
+						warnedAboutWindowCaptureStart = true;
+					}
 					clear_capture_sessions();
 					device.Reset();
 					context.Reset();
@@ -1158,14 +1129,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 				}
 				targetCoversMonitor = currentTargetCoversMonitor;
 				haveTargetCoverageState = true;
-				if (!targetCoversMonitor) {
-					obs_log(LOG_WARNING,
-						"DXGI is disabled because the selected window does not exactly cover its monitor; "
-						"using Game Capture to prevent desktop content from appearing.");
-				} else {
-					obs_log(LOG_INFO,
-						"Selected window exactly covers its monitor; full-monitor DXGI output is safe.");
-				}
 			}
 		}
 
@@ -1205,9 +1168,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 						dxgiDuplication.Reset();
 						dxgiContext.Reset();
 						dxgiDevice.Reset();
-					} else {
-						obs_log(LOG_INFO,
-							"Foreground DXGI capture started for the focused application.");
 					}
 				} else {
 					start_monitor_capture();
@@ -1256,24 +1216,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			obs_log(LOG_INFO, "Active video capture path: %s.", capturePath);
 			haveLoggedCaptureMode = true;
 			lastLoggedMonitorMode = usingMonitorCapture;
-			capturedFrames = 0;
-			lastFpsLog = focusCheckTimeNs;
-			diagnosticFrames = 0;
-			validTimestampFrames = 0;
-			sourceIntervalCount = 0;
-			sourceIntervalSumNs = 0;
-			sourceIntervalMinNs = UINT64_MAX;
-			sourceIntervalMaxNs = 0;
-			dequeueAgeSumNs = 0;
-			dequeueAgeMinNs = INT64_MAX;
-			dequeueAgeMaxNs = INT64_MIN;
-			submissionAgeSumNs = 0;
-			submissionAgeMinNs = INT64_MAX;
-			submissionAgeMaxNs = INT64_MIN;
-			dequeueToSubmissionSumNs = 0;
-			dequeueToSubmissionMaxNs = 0;
-			previousFrameTimestampNs = 0;
-			lastTimingLogNs = focusCheckTimeNs;
 		}
 		if (useGameCaptureWhenUnfocused &&
 		    (lastVideoInfoCheckNs == 0 ||
@@ -1288,7 +1230,7 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 				if (!warnedAboutVideoInfo)
 					obs_log(LOG_WARNING,
 						"Could not read OBS output frame rate; DXGI will remain uncapped "
-						"(using 60 FPS as the diagnostic target).");
+						"(using 60 FPS for frame pacing).");
 				warnedAboutVideoInfo = true;
 				outputFrameIntervalNs = 1'000'000'000ULL / 60;
 			}
@@ -1472,7 +1414,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			    stillActive.clientRect.top == target.clientRect.top &&
 			    stillActive.clientRect.right == target.clientRect.right &&
 			    stillActive.clientRect.bottom == target.clientRect.bottom) {
-				uint64_t submissionTimeNs = 0;
 				if (captureCursor && dxgiPointerVisible) {
 					cursorFramePixels.resize(static_cast<size_t>(byteCount));
 					for (uint32_t y = 0; y < height; ++y)
@@ -1489,30 +1430,16 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 						desktopDesc.Width, desktopDesc.Height);
 					output_captured_frame(
 						capture, cursorFramePixels.data(), width, height,
-						width * 4, frameAcquiredTimeNs, submissionTimeNs,
+						width * 4, frameAcquiredTimeNs,
 						&reusableOutputPixels);
 				} else {
 					output_mapped_dxgi_frame(
 						capture, static_cast<uint8_t *>(mapped.pData), width,
-						height, mapped.RowPitch, frameAcquiredTimeNs,
-						submissionTimeNs);
+						height, mapped.RowPitch, frameAcquiredTimeNs);
 				}
 				dxgiContext->Unmap(dxgiStaging.Get(), 0);
 				if (useGameCaptureWhenUnfocused)
 					capture->dxgiCaptureActive.store(true);
-				++dxgiCapturedFrames;
-				const uint64_t now = os_gettime_ns();
-				if (now - lastDxgiFpsLogNs >= 5'000'000'000ULL) {
-					obs_log(LOG_INFO,
-						"DXGI fresh-frame rate: %.1f FPS (OBS output target: %.2f FPS).",
-						static_cast<double>(dxgiCapturedFrames) * 1'000'000'000.0 /
-							static_cast<double>(now - lastDxgiFpsLogNs),
-						outputFrameIntervalNs > 0 ?
-							1'000'000'000.0 / outputFrameIntervalNs :
-							0.0);
-					dxgiCapturedFrames = 0;
-					lastDxgiFpsLogNs = now;
-				}
 				unavailableFrameSent = false;
 			} else {
 				dxgiContext->Unmap(dxgiStaging.Get(), 0);
@@ -1592,8 +1519,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			WaitForSingleObject(capture->videoStopEvent, 100);
 			continue;
 		}
-		const uint64_t dequeueTimeNs = os_gettime_ns();
-
 		ComPtr<ID3D11Texture2D> desktopTexture;
 		HRESULT result = S_OK;
 		D3D11_TEXTURE2D_DESC desktopDesc{};
@@ -1605,7 +1530,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 				if (timestampNs <= lastSubmittedFrameTimestampNs ||
 				    (nextDueNs > 0 && timestampNs + slackNs < nextDueNs)) {
 					frame = nullptr;
-					++pacingDroppedFrames;
 				}
 			}
 		}
@@ -1704,49 +1628,15 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 					    stillActive.clientRect.bottom == target.clientRect.bottom) {
 						const uint64_t frameTimestampNs =
 							static_cast<uint64_t>(frame.SystemRelativeTime().count()) * 100;
-						uint64_t submissionTimeNs = 0;
 						output_captured_frame(
 							capture, static_cast<uint8_t *>(mapped.pData), width,
-							height, mapped.RowPitch, frameTimestampNs, submissionTimeNs);
+							height, mapped.RowPitch, frameTimestampNs);
 						lastSubmittedFrameTimestampNs = frameTimestampNs;
 						if (outputFrameIntervalNs > 0)
 							nextDueNs = (nextDueNs == 0 ||
 								     frameTimestampNs > nextDueNs + outputFrameIntervalNs) ?
 									    frameTimestampNs + outputFrameIntervalNs :
 									    nextDueNs + outputFrameIntervalNs;
-						if (frameTimestampNs > 0 && submissionTimeNs >= dequeueTimeNs) {
-							const int64_t dequeueAgeNs =
-								static_cast<int64_t>(dequeueTimeNs) -
-								static_cast<int64_t>(frameTimestampNs);
-							const int64_t submissionAgeNs =
-								static_cast<int64_t>(submissionTimeNs) -
-								static_cast<int64_t>(frameTimestampNs);
-							++validTimestampFrames;
-							dequeueAgeSumNs += dequeueAgeNs;
-							dequeueAgeMinNs = std::min(dequeueAgeMinNs, dequeueAgeNs);
-							dequeueAgeMaxNs = std::max(dequeueAgeMaxNs, dequeueAgeNs);
-							submissionAgeSumNs += submissionAgeNs;
-							submissionAgeMinNs =
-								std::min(submissionAgeMinNs, submissionAgeNs);
-							submissionAgeMaxNs =
-								std::max(submissionAgeMaxNs, submissionAgeNs);
-							dequeueToSubmissionSumNs += submissionTimeNs - dequeueTimeNs;
-							dequeueToSubmissionMaxNs =
-								std::max(dequeueToSubmissionMaxNs, submissionTimeNs - dequeueTimeNs);
-							if (previousFrameTimestampNs > 0 &&
-							    frameTimestampNs > previousFrameTimestampNs) {
-								const uint64_t intervalNs =
-									frameTimestampNs - previousFrameTimestampNs;
-								sourceIntervalSumNs += intervalNs;
-								++sourceIntervalCount;
-								sourceIntervalMinNs =
-									std::min(sourceIntervalMinNs, intervalNs);
-								sourceIntervalMaxNs =
-									std::max(sourceIntervalMaxNs, intervalNs);
-							}
-							previousFrameTimestampNs = frameTimestampNs;
-						}
-						++diagnosticFrames;
 						unavailableFrameSent = false;
 						frameOutput = true;
 					} else if (!unavailableFrameSent) {
@@ -1772,73 +1662,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 		}
 		if (SUCCEEDED(result) && frameOutput) {
 			warnedAboutFrame = false;
-			++capturedFrames;
-			const uint64_t now = os_gettime_ns();
-			if (now - lastFpsLog >= 5'000'000'000ULL) {
-				obs_log(LOG_INFO,
-					"Windows Graphics Capture %s output rate: %.1f FPS.",
-					usingMonitorCapture ? "monitor" : "window",
-					static_cast<double>(capturedFrames) * 1'000'000'000.0 /
-						static_cast<double>(now - lastFpsLog));
-				capturedFrames = 0;
-				lastFpsLog = now;
-				obs_log(LOG_INFO,
-					"WGC pacing: %llu frames skipped by output-rate pacing in the last interval.",
-					static_cast<unsigned long long>(pacingDroppedFrames));
-				pacingDroppedFrames = 0;
-			}
-			if (now - lastTimingLogNs >= 5'000'000'000ULL) {
-				if (validTimestampFrames > 0) {
-					obs_log(LOG_INFO,
-						"WGC %s timing (5s): frames=%llu timestamped=%llu "
-						"source_interval_ms avg/min/max=%.2f/%.2f/%.2f "
-						"dequeue_age_ms avg/min/max=%.2f/%.2f/%.2f "
-						"submit_age_ms avg/min/max=%.2f/%.2f/%.2f "
-						"dequeue_to_submit_ms avg/max=%.2f/%.2f",
-						usingMonitorCapture ? "monitor" : "window",
-						static_cast<unsigned long long>(diagnosticFrames),
-						static_cast<unsigned long long>(validTimestampFrames),
-						sourceIntervalCount > 0
-							? static_cast<double>(sourceIntervalSumNs) /
-								  static_cast<double>(sourceIntervalCount) / 1'000'000.0
-							: 0.0,
-						sourceIntervalMinNs == UINT64_MAX
-							? 0.0
-							: static_cast<double>(sourceIntervalMinNs) / 1'000'000.0,
-						static_cast<double>(sourceIntervalMaxNs) / 1'000'000.0,
-						static_cast<double>(dequeueAgeSumNs) /
-							static_cast<double>(validTimestampFrames) / 1'000'000.0,
-						static_cast<double>(dequeueAgeMinNs) / 1'000'000.0,
-						static_cast<double>(dequeueAgeMaxNs) / 1'000'000.0,
-						static_cast<double>(submissionAgeSumNs) /
-							static_cast<double>(validTimestampFrames) / 1'000'000.0,
-						static_cast<double>(submissionAgeMinNs) / 1'000'000.0,
-						static_cast<double>(submissionAgeMaxNs) / 1'000'000.0,
-						static_cast<double>(dequeueToSubmissionSumNs) /
-							static_cast<double>(validTimestampFrames) / 1'000'000.0,
-						static_cast<double>(dequeueToSubmissionMaxNs) / 1'000'000.0);
-				} else {
-					obs_log(LOG_WARNING,
-						"WGC timing (5s): frames=%llu but no valid frame timestamps were "
-						"available.",
-						static_cast<unsigned long long>(diagnosticFrames));
-				}
-				diagnosticFrames = 0;
-				validTimestampFrames = 0;
-				sourceIntervalCount = 0;
-				sourceIntervalSumNs = 0;
-				sourceIntervalMinNs = UINT64_MAX;
-				sourceIntervalMaxNs = 0;
-				dequeueAgeSumNs = 0;
-				dequeueAgeMinNs = INT64_MAX;
-				dequeueAgeMaxNs = INT64_MIN;
-				submissionAgeSumNs = 0;
-				submissionAgeMinNs = INT64_MAX;
-				submissionAgeMaxNs = INT64_MIN;
-				dequeueToSubmissionSumNs = 0;
-				dequeueToSubmissionMaxNs = 0;
-				lastTimingLogNs = now;
-			}
 		} else if (!frame) {
 			WindowInfo stillActive{};
 			if (!get_window_info(currentWindow, processId, stillActive) && !unavailableFrameSent) {
@@ -1964,8 +1787,13 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 	uint32_t lastHeight = kFallbackHeight;
 	bool unavailableFrameSent = false;
 	bool warnedAboutInitialization = false;
+	bool warnedAboutMonitorBounds = false;
 	bool warnedAboutCapture = false;
 	bool warnedAboutCursor = false;
+	bool warnedAboutFrameTexture = false;
+	bool warnedAboutCrop = false;
+	bool warnedAboutStagingTexture = false;
+	bool warnedAboutFrameMap = false;
 	std::vector<uint8_t> pointerShape;
 	DXGI_OUTDUPL_POINTER_SHAPE_INFO pointerShapeInfo{};
 	POINT pointerPosition{};
@@ -2012,14 +1840,18 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 			currentMonitor = target.monitor;
 			MONITORINFO monitorInfo{sizeof(monitorInfo)};
 			if (!GetMonitorInfoW(currentMonitor, &monitorInfo)) {
-				obs_log(LOG_WARNING,
-					"Could not determine the selected application's monitor bounds "
-					"(error %lu).",
-					GetLastError());
+				if (!warnedAboutMonitorBounds) {
+					obs_log(LOG_WARNING,
+						"Could not determine the selected application's monitor bounds "
+						"(error %lu).",
+						GetLastError());
+					warnedAboutMonitorBounds = true;
+				}
 				currentMonitor = nullptr;
 				continue;
 			}
 			currentMonitorRect = monitorInfo.rcMonitor;
+			warnedAboutMonitorBounds = false;
 		}
 
 		if (!duplication) {
@@ -2049,7 +1881,6 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 				continue;
 			}
 			warnedAboutInitialization = false;
-			obs_log(LOG_INFO, "DXGI Desktop Duplication started for monitor %p.", currentMonitor);
 		}
 
 		DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -2113,9 +1944,12 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 		ComPtr<ID3D11Texture2D> desktopTexture;
 		HRESULT result = resource.As(&desktopTexture);
 		if (FAILED(result)) {
-			obs_log(LOG_WARNING,
-				"Could not access a DXGI Desktop Duplication frame texture (0x%08lX).",
-				static_cast<unsigned long>(result));
+			if (!warnedAboutFrameTexture) {
+				obs_log(LOG_WARNING,
+					"Could not access a DXGI Desktop Duplication frame texture (0x%08lX).",
+					static_cast<unsigned long>(result));
+				warnedAboutFrameTexture = true;
+			}
 			continue;
 		}
 
@@ -2146,7 +1980,10 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 		const uint64_t byteCount = static_cast<uint64_t>(width) * height * 4;
 		if (width > kMaxCaptureDimension || height > kMaxCaptureDimension ||
 		    byteCount > kMaxCaptureBytes) {
-			obs_log(LOG_WARNING, "DXGI Desktop Duplication crop exceeds capture limits.");
+			if (!warnedAboutCrop) {
+				obs_log(LOG_WARNING, "DXGI Desktop Duplication crop exceeds capture limits.");
+				warnedAboutCrop = true;
+			}
 			continue;
 		}
 
@@ -2170,10 +2007,13 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 			staging.Reset();
 			result = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
 			if (FAILED(result)) {
-				obs_log(LOG_WARNING,
-					"Could not create the DXGI Desktop Duplication staging texture "
-					"(0x%08lX).",
-					static_cast<unsigned long>(result));
+				if (!warnedAboutStagingTexture) {
+					obs_log(LOG_WARNING,
+						"Could not create the DXGI Desktop Duplication staging texture "
+						"(0x%08lX).",
+						static_cast<unsigned long>(result));
+					warnedAboutStagingTexture = true;
+				}
 				continue;
 			}
 		}
@@ -2186,9 +2026,12 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 		D3D11_MAPPED_SUBRESOURCE mapped{};
 		result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
 		if (FAILED(result)) {
-			obs_log(LOG_WARNING,
-				"Could not map a DXGI Desktop Duplication frame (0x%08lX).",
-				static_cast<unsigned long>(result));
+			if (!warnedAboutFrameMap) {
+				obs_log(LOG_WARNING,
+					"Could not map a DXGI Desktop Duplication frame (0x%08lX).",
+					static_cast<unsigned long>(result));
+				warnedAboutFrameMap = true;
+			}
 			continue;
 		}
 
@@ -2212,9 +2055,8 @@ bool desktop_duplication_capture_loop(GameOutputCapture *capture)
 		    stillActive.clientRect.top == target.clientRect.top &&
 		    stillActive.clientRect.right == target.clientRect.right &&
 		    stillActive.clientRect.bottom == target.clientRect.bottom) {
-			uint64_t submissionTimeNs = 0;
 			output_captured_frame(capture, framePixels.data(), width, height, width * 4,
-					      os_gettime_ns(), submissionTimeNs);
+					      os_gettime_ns());
 		}
 	}
 
@@ -2369,8 +2211,6 @@ bool capture_audio(GameOutputCapture *capture, DWORD processId, HANDLE stopEvent
 		obs_log(LOG_ERROR, "Could not start process-loopback audio capture (0x%08lX).", result);
 		return false;
 	}
-	obs_log(LOG_INFO, "Windows process-loopback audio started for PID %lu.", processId);
-
 	const uint32_t sampleRate = audioFormat.Format.nSamplesPerSec;
 	const uint32_t bytesPerFrame = audioFormat.Format.nBlockAlign;
 	std::vector<float> left;
@@ -2504,8 +2344,6 @@ void process_monitor_loop(GameOutputCapture *capture, HANDLE stopEvent)
 
 		const DWORD previousProcessId = capture->processId.exchange(processId);
 		if (previousProcessId != processId) {
-			obs_log(LOG_INFO, "Matched application process changed from %lu to %lu.", previousProcessId,
-				processId);
 			reset_hybrid_capture_for_target_change(capture);
 			start_audio_capture(capture, processId);
 		}
@@ -2604,7 +2442,6 @@ bool start_video_capture_locked(GameOutputCapture *capture, CaptureBackend backe
 		return false;
 	}
 
-	obs_log(LOG_INFO, "%s capture backend enabled.", backend_display_name(backend));
 	return true;
 }
 
@@ -2992,7 +2829,6 @@ void update_source(void *data, obs_data_t *settings)
 	const DWORD processId = find_process_by_window_match(windowMatch, priority);
 	const DWORD previousProcessId = capture->processId.exchange(processId);
 	if (previousProcessId != processId) {
-		obs_log(LOG_INFO, "Matched application process id: %lu.", processId);
 		reset_hybrid_capture_for_target_change(capture);
 		start_audio_capture(capture, processId);
 	}
@@ -3067,9 +2903,6 @@ void destroy_source(void *data)
 {
 	auto *capture = static_cast<GameOutputCapture *>(data);
 	const CaptureBackend currentBackend = capture->backend.load();
-	obs_log(LOG_INFO, "Destroying capture source (backend=%s, video_thread=%s).",
-		backend_display_name(currentBackend),
-		capture->videoThread.joinable() ? "running" : "stopped");
 	capture->shuttingDown.store(true);
 	stop_process_monitor(capture);
 	stop_audio_capture(capture);
@@ -3093,7 +2926,6 @@ void destroy_source(void *data)
 	if (capture->gameCaptureSource) {
 		obs_source_release(capture->gameCaptureSource);
 	}
-	obs_log(LOG_INFO, "Capture source teardown complete.");
 	delete capture;
 }
 
