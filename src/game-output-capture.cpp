@@ -1217,25 +1217,6 @@ void video_capture_loop_impl(GameOutputCapture *capture, bool useDxgiForeground,
 			haveLoggedCaptureMode = true;
 			lastLoggedMonitorMode = usingMonitorCapture;
 		}
-		if (useGameCaptureWhenUnfocused &&
-		    (lastVideoInfoCheckNs == 0 ||
-		     focusCheckTimeNs - lastVideoInfoCheckNs >= 1'000'000'000ULL)) {
-			obs_video_info videoInfo{};
-			if (obs_get_video_info(&videoInfo) && videoInfo.fps_num > 0 &&
-			    videoInfo.fps_den > 0) {
-				outputFrameIntervalNs =
-					1'000'000'000ULL * videoInfo.fps_den / videoInfo.fps_num;
-				warnedAboutVideoInfo = false;
-			} else {
-				if (!warnedAboutVideoInfo)
-					obs_log(LOG_WARNING,
-						"Could not read OBS output frame rate; DXGI will remain uncapped "
-						"(using 60 FPS for frame pacing).");
-				warnedAboutVideoInfo = true;
-				outputFrameIntervalNs = 1'000'000'000ULL / 60;
-			}
-			lastVideoInfoCheckNs = focusCheckTimeNs;
-		}
 		if (useGameCaptureWhenUnfocused && !usingMonitorCapture) {
 			if (!foregroundEventsAvailable) {
 				WaitForSingleObject(capture->videoStopEvent, INFINITE);
